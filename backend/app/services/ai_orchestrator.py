@@ -23,6 +23,9 @@ from app.models.conversation import Conversation, Message, MessageRole
 from app.models.dataset import Dataset
 from app.models.organization import OrgMembership, OrgRole
 from app.models.query import QueryExecution
+from app.analytics.ambiguity import AmbiguityDetector
+from app.analytics.metrics import default_metric_catalog
+from app.analytics.pipeline import ResultExplainer, ResultVerifier, VerifiedKPI
 from app.schemas.chart import ChartSpec
 from app.schemas.query_plan import QueryPlan
 from app.security.redaction import redact_dictionary, redact_string
@@ -187,6 +190,18 @@ class AIOrchestrator:
                         })
                     else:
                         result_str = json.dumps({"error": "Dataset not found or access denied for this organization"})
+
+                # Tool 2b: get_metric_definition
+                elif func_name == "get_metric_definition":
+                    metric_name = args.get("metric_name", "")
+                    m = default_metric_catalog.get_metric(metric_name)
+                    if not m:
+                        matches = default_metric_catalog.search_by_term(metric_name)
+                        m = matches[0] if matches else None
+                    if m:
+                        result_str = json.dumps(m.to_dict())
+                    else:
+                        result_str = json.dumps({"error": f"Metric '{metric_name}' not found in semantic catalog."})
 
                 # Tool 3: validate_query
                 elif func_name == "validate_query":

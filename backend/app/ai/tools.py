@@ -43,6 +43,23 @@ def get_agent_tools() -> List[Dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "get_metric_definition",
+                "description": "Retrieves the formal business definition, formula, unit, dimensions, and null handling for a named metric (e.g. revenue, profit, conversion_rate, customer_churn, retention, aov).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "metric_name": {
+                            "type": "string",
+                            "description": "The metric identifier or name (e.g. 'revenue', 'profit', 'conversion_rate', 'churn', 'retention').",
+                        },
+                    },
+                    "required": ["metric_name"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "validate_query",
                 "description": "Deterministically checks that a proposed SQL query is safe, read-only, references valid tables, and does not contain DDL/DML.",
                 "parameters": {
@@ -131,8 +148,8 @@ def get_agent_tools() -> List[Dict[str, Any]]:
                         "time_column": {"type": "string"},
                         "method": {
                             "type": "string",
-                            "enum": ["z_score", "iqr"],
-                            "default": "z_score",
+                            "enum": ["mad", "rolling_baseline", "seasonal_comparison", "z_score", "iqr"],
+                            "default": "mad",
                         },
                     },
                     "required": ["dataset_id", "metric_column"],

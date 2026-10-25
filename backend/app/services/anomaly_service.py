@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 import structlog
 
+from app.analytics.anomaly import AdvancedAnomalyDetector, AnomalyMethod
 from app.models.anomaly import AnomalyDetection, AnomalySeverity, AnomalyStatus
 from app.models.dataset import Dataset
 from app.services.audit_service import AuditService
@@ -33,12 +34,13 @@ class AnomalyService:
         dataset_id: uuid.UUID,
         metric_column: str,
         time_column: Optional[str] = None,
-        method: str = "z_score",
+        method: str = "mad",
         sensitivity: str = "medium",
         min_sample_size: int = 10,
     ) -> List[AnomalyDetection]:
         """
         Run statistical anomaly detection over a numeric column in the dataset.
+        Supports MAD, Rolling Baseline, Seasonal Comparison, Z-Score, and IQR.
         """
         stmt = (
             select(Dataset)
@@ -79,87 +81,81 @@ class AnomalyService:
                     values.append(float(v))
                     if time_column and r.get(time_column):
                         timestamps.append(str(r.get(time_column)))
+                else:
+                    values.append(None)
+                    if time_column:
+                        timestamps.append(str(r.get(time_column)) if r.get(time_column) else None)
 
-            arr = np.array(values)
-            n = len(arr)
-            if n < min_sample_size:
+            # Map method string to AnomalyMethod enum
+            method_clean = method.lower().strip()
+            if method_clean in ("mad", "median_absolute_deviation"):
+                chosen_method = AnomalyMethod.MAD
+            elif method_clean in ("rolling", "rolling_baseline", "moving_average"):
+                chosen_method = AnomalyMethod.ROLLING_BASELINE
+            elif method_clean in ("seasonal", "seasonal_comparison", "week_over_week"):
+                chosen_method = AnomalyMethod.SEASONAL_COMPARISON
+            elif method_clean in ("iqr", "interquartile"):
+                chosen_method = AnomalyMethod.IQR
+            else:
+                chosen_method = AnomalyMethod.Z_SCORE
+
+            diag_result = AdvancedAnomalyDetector.detect(
+                values=values,
+                timestamps=timestamps if time_column else None,
+                metric_name=metric_column,
+                method=chosen_method,
+                sensitivity=sensitivity,
+            )
+
+            if diag_result.insufficient_data_reason:
+                logger.info(
+                    "anomaly_detection_insufficient_data",
+                    reason=diag_result.insufficient_data_reason,
+                )
                 return []
 
             anomalies: List[AnomalyDetection] = []
+            now_utc = datetime.now(timezone.utc)
 
-            # Sensitivity multiplier
-            threshold = 3.0 if sensitivity == "low" else (2.5 if sensitivity == "medium" else 2.0)
+            for finding in diag_result.anomalies:
+                sev_map = {
+                    "low": AnomalySeverity.LOW,
+                    "medium": AnomalySeverity.MEDIUM,
+                    "high": AnomalySeverity.HIGH,
+                    "critical": AnomalySeverity.CRITICAL,
+                }
+                sev = sev_map.get(finding.severity.value, AnomalySeverity.MEDIUM)
 
-            if method == "iqr":
-                q25, q75 = np.percentile(arr, [25, 75])
-                iqr = q75 - q25
-                iqr_factor = 1.8 if sensitivity == "low" else (1.5 if sensitivity == "medium" else 1.2)
-                lower_bound = q25 - iqr_factor * iqr
-                upper_bound = q75 + iqr_factor * iqr
-                median_val = float(np.median(arr))
-
-                for idx, val in enumerate(arr):
-                    if val < lower_bound or val > upper_bound:
-                        dev = abs(val - median_val) / (iqr if iqr > 0 else 1.0)
-                        severity = AnomalySeverity.CRITICAL if dev > 3.0 else (
-                            AnomalySeverity.HIGH if dev > 2.0 else AnomalySeverity.MEDIUM
-                        )
-                        anom = AnomalyDetection(
-                            org_id=org_id,
-                            dataset_id=dataset_id,
-                            metric_name=metric_column,
-                            metric_value=round(val, 4),
-                            expected_value=round(median_val, 4),
-                            deviation_score=round(dev, 2),
-                            severity=severity,
-                            status=AnomalyStatus.DETECTED,
-                            detection_method="iqr",
-                            explanation=f"Value {val} deviated significantly from median baseline {median_val:.2f} (IQR [{lower_bound:.2f}, {upper_bound:.2f}]). Note: Statistical observation only; does not prove causality.",
-                            supporting_data={
-                                "q25": float(q25),
-                                "q75": float(q75),
-                                "iqr": float(iqr),
-                                "timestamp": timestamps[idx] if idx < len(timestamps) else None,
-                            },
-                        )
-                        anomalies.append(anom)
-            else:
-                # Default: Z-score detection
-                mean_val = float(np.mean(arr))
-                std_val = float(np.std(arr))
-
-                if std_val > 0:
-                    z_scores = (arr - mean_val) / std_val
-                    for idx, (val, z) in enumerate(zip(arr, z_scores)):
-                        if abs(z) >= threshold:
-                            severity = AnomalySeverity.CRITICAL if abs(z) >= 4.0 else (
-                                AnomalySeverity.HIGH if abs(z) >= 3.0 else AnomalySeverity.MEDIUM
-                            )
-                            anom = AnomalyDetection(
-                                org_id=org_id,
-                                dataset_id=dataset_id,
-                                metric_name=metric_column,
-                                metric_value=round(val, 4),
-                                expected_value=round(mean_val, 4),
-                                deviation_score=round(float(abs(z)), 2),
-                                severity=severity,
-                                status=AnomalyStatus.DETECTED,
-                                detection_method="z_score",
-                                explanation=f"Observed value {val} deviated {abs(z):.2f} standard deviations from historical mean {mean_val:.2f}. Note: Statistical observation only; does not prove causality.",
-                                supporting_data={
-                                    "mean": round(mean_val, 4),
-                                    "std": round(std_val, 4),
-                                    "z_score": round(float(z), 2),
-                                    "sample_size": n,
-                                    "timestamp": timestamps[idx] if idx < len(timestamps) else None,
-                                },
-                            )
-                            anomalies.append(anom)
+                anom = AnomalyDetection(
+                    org_id=org_id,
+                    dataset_id=dataset_id,
+                    metric_name=metric_column,
+                    metric_value=finding.observed_value,
+                    expected_range_low=finding.lower_bound,
+                    expected_range_high=finding.upper_bound,
+                    severity=sev,
+                    status=AnomalyStatus.DETECTED,
+                    description=finding.explanation,
+                    detection_metadata={
+                        "expected_value": finding.expected_value,
+                        "deviation_score": finding.deviation_score,
+                        "method": finding.method.value,
+                        "timestamp": finding.timestamp,
+                        "sample_size": finding.sample_size,
+                        "supporting_evidence": finding.supporting_evidence,
+                        "causal_disclaimer": finding.causal_disclaimer,
+                    },
+                    detected_at=now_utc,
+                )
+                anomalies.append(anom)
 
             # Deduplicate and save only highest severity anomalies (up to 20)
             if anomalies:
                 # Sort by deviation score descending
-                anomalies.sort(key=lambda a: a.deviation_score or 0, reverse=True)
+                anomalies.sort(
+                    key=lambda a: (a.detection_metadata or {}).get("deviation_score", 0),
+                    reverse=True,
+                )
                 top_anomalies = anomalies[:20]
 
                 for a in top_anomalies:
@@ -175,7 +171,8 @@ class AnomalyService:
                     details={
                         "metric": metric_column,
                         "anomalies_count": len(top_anomalies),
-                        "method": method,
+                        "method": chosen_method.value,
+                        "dq_warnings_count": len(diag_result.data_quality_warnings),
                     },
                 )
                 for a in top_anomalies:
