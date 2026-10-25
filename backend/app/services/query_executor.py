@@ -1,10 +1,12 @@
 """
-Safe read-only Query Execution Engine.
-Validates SQL through SQLValidator, enforces timeouts, row limits, and records immutable QueryExecution records.
+Safe Read-Only Query Execution Engine.
+Hardened with schema-validated query plans, RBAC permission gates, AST safety checks,
+database-enforced timeouts, RLS tenant context, and immutable audit logs.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from typing import Optional
@@ -17,7 +19,10 @@ import structlog
 from app.config import get_settings
 from app.connectors.base import QueryResult
 from app.models.dataset import Dataset
+from app.models.organization import OrgMembership, OrgRole
 from app.models.query import ExecutionStatus, QueryExecution, ValidationStatus
+from app.schemas.query_plan import QueryPlan
+from app.security.redaction import redact_string
 from app.services.audit_service import AuditService
 from app.services.data_source_service import DataSourceService
 from app.services.sql_validator import SQLValidator
@@ -36,33 +41,80 @@ class QueryExecutor:
         sql_query: str,
         message_id: Optional[uuid.UUID] = None,
         custom_timeout: Optional[int] = None,
+        query_plan: Optional[QueryPlan] = None,
     ) -> tuple[QueryExecution, Optional[QueryResult]]:
         """
         Validate, audit, and execute an untrusted read-only query against the target dataset's data source.
+        Enforces:
+        1. Role-based execution authorization (rejects Viewers from arbitrary query execution)
+        2. Strict tenant-ownership of dataset
+        3. Optional typed QueryPlan schema conformance
+        4. AST-based fail-closed SQL validation
+        5. Database-level read-only isolation with RLS session variables
+        6. Comprehensive audit trail for both accepted and rejected attempts
         """
-        # 1. Fetch Dataset and DataSource
-        stmt = (
+        # 1. Authorize User Organization Membership and Role
+        stmt_mem = select(OrgMembership).where(
+            OrgMembership.org_id == org_id,
+            OrgMembership.user_id == user_id,
+        )
+        mem_res = await db.execute(stmt_mem)
+        membership = mem_res.scalar_one_or_none()
+
+        if not membership:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User does not have access to this organization",
+            )
+
+        if membership.role == OrgRole.VIEWER:
+            await AuditService.log_event(
+                db,
+                org_id=org_id,
+                user_id=user_id,
+                action="query.forbidden_role",
+                resource_type="dataset",
+                resource_id=dataset_id,
+                details={"role": membership.role.value, "reason": "Viewers cannot execute arbitrary queries"},
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Viewer role is not permitted to execute ad-hoc analytical queries",
+            )
+
+        # 2. Fetch Dataset with underlying DataSource (strictly scoped by org_id)
+        stmt_ds = (
             select(Dataset)
             .options(selectinload(Dataset.data_source))
             .where(Dataset.id == dataset_id, Dataset.org_id == org_id)
         )
-        res = await db.execute(stmt)
+        res = await db.execute(stmt_ds)
         dataset = res.scalar_one_or_none()
 
         if not dataset or not dataset.data_source:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Dataset or underlying data source not found",
+                detail="Dataset or underlying data source not found in organization",
             )
 
-        # 2. Determine dialect and allowed tables
+        # 3. Validate Query Plan if provided
+        plan_details = {}
+        if query_plan:
+            if query_plan.dataset_id != dataset_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Query plan dataset_id does not match execution target dataset",
+                )
+            plan_details = query_plan.model_dump(mode="json")
+
+        # 4. Determine dialect and allowed tables allowlist
         dialect = "postgres" if dataset.data_source.source_type.value == "postgresql" else "sqlite"
-        allowed_tables = {dataset.table_name.lower()}
+        allowed_tables = {dataset.table_name.lower().strip()}
 
         validator = SQLValidator(allowed_tables=allowed_tables, dialect=dialect)
         val_result = validator.validate(sql_query)
 
-        # 3. Create QueryExecution record (Audit Trail)
+        # 5. Create immutable QueryExecution record (Audit Trail)
         execution_record = QueryExecution(
             org_id=org_id,
             dataset_id=dataset_id,
@@ -73,6 +125,7 @@ class QueryExecutor:
                 "errors": val_result.errors,
                 "warnings": val_result.warnings,
                 "tables_referenced": val_result.tables_referenced,
+                "query_plan": plan_details,
             },
             execution_status=ExecutionStatus.PENDING,
         )
@@ -80,7 +133,7 @@ class QueryExecutor:
         await db.commit()
         await db.refresh(execution_record)
 
-        # If validation failed, reject immediately and record
+        # 6. Fail-Closed Check: If validation failed, reject immediately. Never contact database!
         if not val_result.is_valid:
             execution_record.execution_status = ExecutionStatus.FAILED
             execution_record.error_message = "; ".join(val_result.errors)
@@ -93,11 +146,15 @@ class QueryExecutor:
                 action="query.rejected",
                 resource_type="query_execution",
                 resource_id=execution_record.id,
-                details={"errors": val_result.errors, "sql": sql_query},
+                details={
+                    "errors": val_result.errors,
+                    "tables_referenced": val_result.tables_referenced,
+                    "sql": redact_string(sql_query),
+                },
             )
             return execution_record, None
 
-        # 4. Execute validated query using read-only connector
+        # 7. Execute validated query using read-only connector with RLS context
         execution_record.execution_status = ExecutionStatus.RUNNING
         await db.commit()
 
@@ -110,6 +167,8 @@ class QueryExecutor:
                 sql=val_result.sanitized_sql or sql_query,
                 timeout=timeout,
                 max_rows=max_rows,
+                tenant_id=str(org_id),
+                user_id=str(user_id),
             )
 
             execution_record.execution_status = ExecutionStatus.COMPLETED
@@ -122,7 +181,6 @@ class QueryExecutor:
             }
             # Store first 100 rows preview in DB record for quick retrieval
             execution_record.result_data = query_result.rows[:100]
-
             await db.commit()
 
             await AuditService.log_event(
@@ -140,11 +198,29 @@ class QueryExecutor:
             )
             return execution_record, query_result
 
+        except (asyncio.TimeoutError, TimeoutError) as te:
+            logger.warning("query_execution_timed_out", sql=redact_string(sql_query), timeout=timeout)
+            execution_record.execution_status = ExecutionStatus.TIMEOUT
+            execution_record.error_message = f"Query timed out after {timeout} seconds"
+            await db.commit()
+
+            await AuditService.log_event(
+                db,
+                org_id=org_id,
+                user_id=user_id,
+                action="query.timeout",
+                resource_type="query_execution",
+                resource_id=execution_record.id,
+                details={"timeout_seconds": timeout},
+            )
+            return execution_record, None
+
         except Exception as e:
-            err_msg = str(e)
-            logger.error("query_execution_failed", error=err_msg, sql=sql_query)
+            raw_err = str(e)
+            safe_err = redact_string(raw_err)
+            logger.error("query_execution_failed", error=safe_err, sql=redact_string(sql_query))
             execution_record.execution_status = ExecutionStatus.FAILED
-            execution_record.error_message = err_msg
+            execution_record.error_message = safe_err
             await db.commit()
 
             await AuditService.log_event(
@@ -154,7 +230,7 @@ class QueryExecutor:
                 action="query.failed",
                 resource_type="query_execution",
                 resource_id=execution_record.id,
-                details={"error": err_msg, "sql": sql_query},
+                details={"error": safe_err, "sql": redact_string(sql_query)},
             )
             return execution_record, None
         finally:

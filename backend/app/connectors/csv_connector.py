@@ -125,18 +125,32 @@ class CSVConnector(BaseConnector):
         sql: str,
         timeout: int = 30,
         max_rows: int = 5000,
+        tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> QueryResult:
         self._ensure_sqlite_ready()
         start_time = time.perf_counter()
+
+        clean_sql = sql.rstrip(";").strip()
 
         # Connect with read-only URI
         uri = f"file:{self.sqlite_path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=timeout)
         conn.row_factory = sqlite3.Row
+
+        # Engine-level SQLite Authorizer: fail-closed against any write/DDL
+        def _authorizer(action, p1, p2, db_name, trigger_name):
+            # 21 = SQLITE_SELECT, 20 = SQLITE_READ, 31 = SQLITE_FUNCTION
+            if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION):
+                return sqlite3.SQLITE_OK
+            return sqlite3.SQLITE_DENY
+
+        conn.set_authorizer(_authorizer)
+
         try:
             cursor = conn.cursor()
             # Wrap query to enforce max row limits
-            wrapped_sql = f"SELECT * FROM ({sql}) LIMIT {max_rows + 1}"
+            wrapped_sql = f"SELECT * FROM ({clean_sql}) LIMIT {max_rows + 1}"
             cursor.execute(wrapped_sql)
             rows = cursor.fetchall()
             execution_time_ms = (time.perf_counter() - start_time) * 1000
@@ -145,7 +159,18 @@ class CSVConnector(BaseConnector):
             active_rows = rows[:max_rows]
 
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            data = [dict(r) for r in active_rows]
+            data = []
+            total_bytes = 0
+            max_bytes = 10 * 1024 * 1024  # 10 MB
+
+            for r in active_rows:
+                d = dict(r)
+                row_bytes = len(str(d))
+                if total_bytes + row_bytes > max_bytes:
+                    truncated = True
+                    break
+                total_bytes += row_bytes
+                data.append(d)
 
             return QueryResult(
                 columns=columns,

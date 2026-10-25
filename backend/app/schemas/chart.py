@@ -4,10 +4,22 @@ Chart specification schemas for frontend visualization rendering.
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+HTML_TAG_REGEX = re.compile(r"<[^>]*>|javascript:|onerror=|onload=", re.IGNORECASE)
+SAFE_IDENTIFIER_REGEX = re.compile(r"^[a-zA-Z0-9_.\- ()%$/]+$")
+
+
+def sanitize_text(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    if HTML_TAG_REGEX.search(text):
+        raise ValueError("Malicious markup or script detected in chart metadata")
+    return text.strip()
 
 
 class ChartType(str, Enum):
@@ -33,6 +45,11 @@ class AxisConfig(BaseModel):
         None, description="Sort order: 'asc' | 'desc' | None"
     )
 
+    @field_validator("field", "label")
+    @classmethod
+    def validate_fields(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
+
 
 class SeriesConfig(BaseModel):
     """Configuration for a data series (used in multi-series charts)."""
@@ -45,6 +62,11 @@ class SeriesConfig(BaseModel):
     aggregate: Optional[str] = Field(
         None, description="Aggregation function: sum | avg | count | min | max"
     )
+
+    @field_validator("field", "label")
+    @classmethod
+    def validate_series_text(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)
 
 
 class ChartFilter(BaseModel):
@@ -96,3 +118,8 @@ class ChartSpec(BaseModel):
     insights: Optional[str] = Field(
         None, description="AI-generated insight about the chart data"
     )
+
+    @field_validator("title", "subtitle", "kpi_value", "insights")
+    @classmethod
+    def validate_chart_text(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_text(v)

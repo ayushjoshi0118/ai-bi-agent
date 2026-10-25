@@ -1,24 +1,32 @@
 """
 PostgreSQL data source connector using asyncpg.
-Enforces read-only transactions, strict timeouts, and tenant isolation.
+Hardened with database-level read-only transactions, least-privilege roles,
+row-level security session context, strict memory ceilings, safe pool recycling,
+and response byte limits.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Any, Dict, List, Optional
 import asyncpg
 import structlog
 
 from app.connectors.base import BaseConnector, ColumnInfo, QueryResult, TableInfo
+from app.security.redaction import redact_string
 
 logger = structlog.get_logger(__name__)
+
+# Max response byte ceiling (10 MB) to prevent memory exhaustion from wide text columns
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 
 
 class PostgresConnector(BaseConnector):
     """
-    Connects to external or internal customer PostgreSQL databases.
-    All executions are performed with `SET TRANSACTION READ ONLY` and explicit timeouts.
+    Connects to external or internal PostgreSQL databases.
+    All executions are performed with `SET TRANSACTION READ ONLY`, strict statement timeouts,
+    memory ceilings, and tenant RLS session variables.
     """
 
     def __init__(
@@ -72,8 +80,8 @@ class PostgresConnector(BaseConnector):
             finally:
                 await conn.close()
         except Exception as e:
-            logger.warning("postgres_connection_test_failed", error=str(e), host=self.host)
-            return False, f"Connection failed: {str(e)}"
+            logger.warning("postgres_connection_test_failed", error=redact_string(str(e)), host=self.host)
+            return False, f"Connection failed: {redact_string(str(e))}"
 
     async def discover_tables(self) -> List[TableInfo]:
         pool = await self.get_pool()
@@ -85,20 +93,23 @@ class PostgresConnector(BaseConnector):
             ORDER BY table_name;
         """
         async with pool.acquire() as conn:
-            records = await conn.fetch(query, self.target_schema)
-            tables = []
-            for rec in records:
-                t_name = rec["table_name"]
-                schema_name = rec["table_schema"]
-                cols = await self.get_table_schema(t_name)
-                tables.append(
-                    TableInfo(
-                        name=t_name,
-                        schema=schema_name,
-                        columns=cols,
+            try:
+                records = await conn.fetch(query, self.target_schema)
+                tables = []
+                for rec in records:
+                    t_name = rec["table_name"]
+                    schema_name = rec["table_schema"]
+                    cols = await self.get_table_schema(t_name)
+                    tables.append(
+                        TableInfo(
+                            name=t_name,
+                            schema=schema_name,
+                            columns=cols,
+                        )
                     )
-                )
-            return tables
+                return tables
+            finally:
+                await conn.execute("RESET ALL;")
 
     async def get_table_schema(self, table_name: str) -> List[ColumnInfo]:
         pool = await self.get_pool()
@@ -112,65 +123,119 @@ class PostgresConnector(BaseConnector):
             ORDER BY ordinal_position;
         """
         async with pool.acquire() as conn:
-            records = await conn.fetch(query, self.target_schema, table_name)
-            columns = []
-            for rec in records:
-                columns.append(
-                    ColumnInfo(
-                        name=rec["column_name"],
-                        data_type=rec["data_type"],
-                        nullable=(rec["is_nullable"].upper() == "YES"),
+            try:
+                records = await conn.fetch(query, self.target_schema, table_name)
+                columns = []
+                for rec in records:
+                    columns.append(
+                        ColumnInfo(
+                            name=rec["column_name"],
+                            data_type=rec["data_type"],
+                            nullable=(rec["is_nullable"].upper() == "YES"),
+                        )
                     )
-                )
-            return columns
+                return columns
+            finally:
+                await conn.execute("RESET ALL;")
 
     async def get_row_count(self, table_name: str) -> int:
         pool = await self.get_pool()
-        # Safe quoted identifier
-        safe_name = f'"{self.target_schema}"."{table_name}"'
+        safe_schema = self.target_schema.replace('"', '""')
+        safe_table = table_name.replace('"', '""')
+        safe_name = f'"{safe_schema}"."{safe_table}"'
         async with pool.acquire() as conn:
-            count = await conn.fetchval(f"SELECT COUNT(*) FROM {safe_name}")
-            return int(count or 0)
+            try:
+                count = await conn.fetchval(f"SELECT COUNT(*) FROM {safe_name}")
+                return int(count or 0)
+            finally:
+                await conn.execute("RESET ALL;")
 
     async def get_sample_data(self, table_name: str, limit: int = 100) -> List[Dict[str, Any]]:
         pool = await self.get_pool()
-        safe_name = f'"{self.target_schema}"."{table_name}"'
+        safe_schema = self.target_schema.replace('"', '""')
+        safe_table = table_name.replace('"', '""')
+        safe_name = f'"{safe_schema}"."{safe_table}"'
+        bounded_limit = min(max(1, limit), 500)
         async with pool.acquire() as conn:
-            records = await conn.fetch(f"SELECT * FROM {safe_name} LIMIT {limit}")
-            return [dict(rec) for rec in records]
+            try:
+                records = await conn.fetch(f"SELECT * FROM {safe_name} LIMIT {bounded_limit}")
+                return [dict(rec) for rec in records]
+            finally:
+                await conn.execute("RESET ALL;")
 
     async def execute_read_only_query(
         self,
         sql: str,
         timeout: int = 30,
         max_rows: int = 5000,
+        tenant_id: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> QueryResult:
+        """
+        Execute an untrusted validated read-only SQL query with database-enforced permissions,
+        RLS session variables, strict timeouts, memory ceilings, and response byte caps.
+        """
         pool = await self.get_pool()
         start_time = time.perf_counter()
 
+        # Clean trailing semicolon before subquery wrapping
+        clean_sql = sql.rstrip(";").strip()
+        safe_timeout = max(1, min(int(timeout), 60))
+
         async with pool.acquire() as conn:
-            # Enforce read-only transaction and strict statement timeout
-            async with conn.transaction(readonly=True):
-                await conn.execute(f"SET LOCAL statement_timeout = '{timeout}s'")
-                await conn.execute(f"SET LOCAL search_path = '{self.target_schema}', public")
+            try:
+                # 1. Start explicit READ ONLY transaction
+                async with conn.transaction(readonly=True):
+                    # 2. Resource limits
+                    await conn.execute(f"SET LOCAL statement_timeout = '{safe_timeout}s'")
+                    await conn.execute("SET LOCAL lock_timeout = '5s'")
+                    await conn.execute("SET LOCAL idle_in_transaction_session_timeout = '10s'")
+                    await conn.execute("SET LOCAL work_mem = '32MB'")
+                    safe_schema = self.target_schema.replace("'", "''")
+                    await conn.execute(f"SET LOCAL search_path = '{safe_schema}', public")
 
-                # Fetch one extra row to determine if result set was truncated
-                records = await conn.fetch(f"SELECT * FROM ({sql}) AS __bi_subquery LIMIT {max_rows + 1}")
-                execution_time_ms = (time.perf_counter() - start_time) * 1000
+                    # 3. Row-Level Security session variables
+                    if tenant_id:
+                        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", str(tenant_id))
+                    if user_id:
+                        await conn.execute("SELECT set_config('app.current_user_id', $1, true)", str(user_id))
 
-                truncated = len(records) > max_rows
-                active_records = records[:max_rows]
+                    # 4. Execute wrapped subquery (limiting to max_rows + 1 to detect truncation)
+                    wrapped = f"SELECT * FROM ({clean_sql}) AS __bi_subquery LIMIT {max_rows + 1}"
+                    records = await conn.fetch(wrapped)
+                    execution_time_ms = (time.perf_counter() - start_time) * 1000
 
-                columns = [k for k in active_records[0].keys()] if active_records else []
-                rows = [dict(rec) for rec in active_records]
+                    truncated = len(records) > max_rows
+                    active_records = records[:max_rows]
 
-                return QueryResult(
-                    columns=columns,
-                    rows=rows,
-                    row_count=len(rows),
-                    execution_time_ms=round(execution_time_ms, 2),
-                    truncated=truncated,
-                )
+                    # 5. Build rows and enforce byte limits
+                    columns = [k for k in active_records[0].keys()] if active_records else []
+                    rows = []
+                    total_bytes = 0
+
+                    for rec in active_records:
+                        row_dict = dict(rec)
+                        # Estimate serialized byte size
+                        row_bytes = len(json.dumps(row_dict, default=str))
+                        if total_bytes + row_bytes > MAX_RESPONSE_BYTES:
+                            truncated = True
+                            break
+                        total_bytes += row_bytes
+                        rows.append(row_dict)
+
+                    return QueryResult(
+                        columns=columns,
+                        rows=rows,
+                        row_count=len(rows),
+                        execution_time_ms=round(execution_time_ms, 2),
+                        truncated=truncated,
+                    )
+            finally:
+                # 6. Hygiene: Discard temporary state and reset session configuration on connection return
+                try:
+                    await conn.execute("RESET ALL; DISCARD TEMP;")
+                except Exception:
+                    pass
 
     async def close(self) -> None:
         if self._pool:
