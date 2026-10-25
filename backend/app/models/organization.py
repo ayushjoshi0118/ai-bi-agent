@@ -94,7 +94,7 @@ class OrgMembership(BaseModel):
         index=True,
     )
     role: Mapped[OrgRole] = mapped_column(
-        Enum(OrgRole, name="org_role", native_enum=True),
+        Enum(OrgRole, name="org_role", native_enum=False, length=50),
         nullable=False,
         default=OrgRole.VIEWER,
     )

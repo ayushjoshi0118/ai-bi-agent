@@ -43,7 +43,7 @@ class ScheduledJob(BaseModel):
         index=True,
     )
     job_type: Mapped[JobType] = mapped_column(
-        Enum(JobType, name="job_type", native_enum=True),
+        Enum(JobType, name="job_type", native_enum=False, length=50),
         nullable=False,
     )
     config: Mapped[dict | None] = mapped_column(
@@ -87,7 +87,7 @@ class JobRun(BaseModel):
         index=True,
     )
     status: Mapped[JobRunStatus] = mapped_column(
-        Enum(JobRunStatus, name="job_run_status", native_enum=True),
+        Enum(JobRunStatus, name="job_run_status", native_enum=False, length=50),
         nullable=False,
         default=JobRunStatus.PENDING,
     )

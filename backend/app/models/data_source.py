@@ -46,7 +46,7 @@ class DataSource(BaseModel):
         String(255), nullable=False,
     )
     source_type: Mapped[SourceType] = mapped_column(
-        Enum(SourceType, name="source_type", native_enum=True),
+        Enum(SourceType, name="source_type", native_enum=False, length=50),
         nullable=False,
     )
     encrypted_credentials: Mapped[bytes | None] = mapped_column(
@@ -56,7 +56,7 @@ class DataSource(BaseModel):
         JSON, nullable=True, default=dict,
     )
     status: Mapped[DataSourceStatus] = mapped_column(
-        Enum(DataSourceStatus, name="data_source_status", native_enum=True),
+        Enum(DataSourceStatus, name="data_source_status", native_enum=False, length=50),
         nullable=False,
         default=DataSourceStatus.PENDING,
     )

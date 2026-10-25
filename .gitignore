@@ -29,6 +29,18 @@ out/
 .env
 .env.local
 .env.*.local
+.env.production
+.env.staging
+!.env.example
+!.env.production.example
+!.env.staging.example
+
+# Certificates & Keys
+*.pem
+*.key
+*.crt
+nginx/certs/*
+!nginx/certs/.gitkeep
 
 # OS
 .DS_Store
@@ -42,9 +54,11 @@ docker-compose.override.yml
 htmlcov/
 .pytest_cache/
 
-# Uploads
+# Uploads & Backups
 uploads/
 temp/
+backups/
+backend/backups/
 
 # Logs
 *.log

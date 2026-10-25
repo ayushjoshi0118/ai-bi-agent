@@ -42,7 +42,7 @@ class Report(BaseModel):
         Text, nullable=True,
     )
     status: Mapped[ReportStatus] = mapped_column(
-        Enum(ReportStatus, name="report_status", native_enum=True),
+        Enum(ReportStatus, name="report_status", native_enum=False, length=50),
         nullable=False,
         default=ReportStatus.DRAFT,
     )

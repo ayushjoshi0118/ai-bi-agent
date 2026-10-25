@@ -1,25 +1,76 @@
 version: "3.9"
 
+# ==============================================================================
+# Production Docker Compose Architecture
+# Multi-stage containers, non-root users, resource budgets, and Nginx proxy
+# ==============================================================================
+
+networks:
+  public-net:
+    driver: bridge
+  internal-net:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata_prod:
+  redisdata_prod:
+  uploads_prod:
+  nginx_certs:
+
 services:
+  # ── Reverse Proxy (Nginx with TLS) ──────────────────────────────────────────
+  reverse-proxy:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    networks:
+      - public-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+  # ── PostgreSQL Database ─────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-biagent}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
       POSTGRES_DB: ${POSTGRES_DB:-biagent_prod}
     volumes:
       - pgdata_prod:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-biagent}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-biagent} -d ${POSTGRES_DB:-biagent_prod}"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
+    networks:
+      - internal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
 
+  # ── Redis Cache & Queue Broker ──────────────────────────────────────────────
   redis:
     image: redis:7-alpine
-    restart: always
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD}
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Redis password required}"]
     volumes:
       - redisdata_prod:/data
     healthcheck:
@@ -27,13 +78,23 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 5s
+    networks:
+      - internal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
+  # ── FastAPI Application Backend ─────────────────────────────────────────────
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    restart: always
-    command: gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+    restart: unless-stopped
+    environment:
+      - RUN_MIGRATIONS=true
     env_file:
       - .env.production
     depends_on:
@@ -43,13 +104,28 @@ services:
         condition: service_healthy
     volumes:
       - uploads_prod:/app/uploads
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - public-net
+      - internal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1536M
 
+  # ── Background Worker (Celery) ──────────────────────────────────────────────
   celery_worker:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    restart: always
-    command: celery -A app.tasks.celery_app worker --loglevel=info --concurrency=4
+    restart: unless-stopped
+    command: ["celery", "-A", "app.tasks.celery_app", "worker", "--loglevel=info", "--concurrency=4"]
     env_file:
       - .env.production
     depends_on:
@@ -59,13 +135,21 @@ services:
         condition: service_healthy
     volumes:
       - uploads_prod:/app/uploads
+    networks:
+      - internal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1536M
 
+  # ── Background Scheduler (Celery Beat) ──────────────────────────────────────
   celery_beat:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    restart: always
-    command: celery -A app.tasks.celery_app beat --loglevel=info
+    restart: unless-stopped
+    command: ["celery", "-A", "app.tasks.celery_app", "beat", "--loglevel=info"]
     env_file:
       - .env.production
     depends_on:
@@ -73,20 +157,35 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - internal-net
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
 
+  # ── Next.js Frontend (SSR Standalone) ───────────────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    restart: always
-    ports:
-      - "80:3000"
-    environment:
-      - NEXT_PUBLIC_API_URL=https://${DOMAIN_NAME}/api/v1
+      args:
+        NEXT_PUBLIC_API_URL: "/api/v1"
+    restart: unless-stopped
     depends_on:
-      - backend
-
-volumes:
-  pgdata_prod:
-  redisdata_prod:
-  uploads_prod:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - public-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M

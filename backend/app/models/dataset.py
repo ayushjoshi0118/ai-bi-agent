@@ -66,7 +66,7 @@ class Dataset(BaseModel):
         DateTime(timezone=True), nullable=True,
     )
     status: Mapped[DatasetStatus] = mapped_column(
-        Enum(DatasetStatus, name="dataset_status", native_enum=True),
+        Enum(DatasetStatus, name="dataset_status", native_enum=False, length=50),
         nullable=False,
         default=DatasetStatus.PENDING,
     )
