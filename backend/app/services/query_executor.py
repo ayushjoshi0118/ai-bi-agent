@@ -21,6 +21,7 @@ from app.connectors.base import QueryResult
 from app.models.dataset import Dataset
 from app.models.organization import OrgMembership, OrgRole
 from app.models.query import ExecutionStatus, QueryExecution, ValidationStatus
+from app.monitoring.metrics import metrics_collector
 from app.schemas.query_plan import QueryPlan
 from app.security.redaction import redact_string
 from app.services.audit_service import AuditService
@@ -174,6 +175,7 @@ class QueryExecutor:
             execution_record.execution_status = ExecutionStatus.COMPLETED
             execution_record.row_count = query_result.row_count
             execution_record.execution_time_ms = query_result.execution_time_ms
+            metrics_collector.record_query(duration_ms=query_result.execution_time_ms)
             execution_record.result_summary = {
                 "columns": query_result.columns,
                 "row_count": query_result.row_count,

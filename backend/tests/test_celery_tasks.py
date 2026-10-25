@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.data_source import DataSource, DataSourceStatus, DataSourceType
 from app.models.dataset import Dataset, DatasetStatus
-from app.models.organization import Organization
+from app.models.organization import Organization, OrgMembership, OrgRole
 from app.models.report import Report, ReportStatus, ReportVersion
 from app.models.scheduled_job import JobRun, JobRunStatus, JobType, ScheduledJob
 from app.models.user import User
@@ -31,6 +31,10 @@ async def test_scheduled_report_task_execution(db_session: AsyncSession):
 
     org = Organization(name="Task Org", slug=f"task-org-{uuid.uuid4().hex[:6]}", created_by=user.id)
     db_session.add(org)
+    await db_session.flush()
+
+    member = OrgMembership(org_id=org.id, user_id=user.id, role=OrgRole.OWNER)
+    db_session.add(member)
     await db_session.flush()
 
     # Create a report

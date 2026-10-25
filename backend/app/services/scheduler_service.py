@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models.scheduled_job import JobRun, JobRunStatus, JobType, ScheduledJob
 from app.schemas.scheduled_job import ScheduledJobCreate, ScheduledJobUpdate
+from app.security.tenant_security import TenantSecurityManager
 from app.services.audit_service import AuditService
 
 MAX_JOBS_PER_ORG = 20
@@ -80,7 +81,14 @@ class SchedulerService:
         res = await db.execute(stmt)
         job = res.scalar_one_or_none()
         if not job:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scheduled job not found")
+            await TenantSecurityManager.verify_object_ownership(
+                db=db,
+                org_id=org_id,
+                user_id=uuid.uuid4(),
+                model_class=ScheduledJob,
+                object_id=job_id,
+                resource_label="scheduled job",
+            )
         return job
 
     @staticmethod

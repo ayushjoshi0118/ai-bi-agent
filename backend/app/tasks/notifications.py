@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import AsyncSessionLocal
 from app.models.notification import Notification
+from app.models.user import User
 from app.tasks.celery_app import celery_app
 
 logger = structlog.get_logger(__name__)
@@ -32,6 +33,31 @@ async def _do_deliver(notif_id: uuid.UUID, session: AsyncSession) -> dict:
     if not notif:
         logger.warning("notification_not_found_for_delivery", notification_id=str(notif_id))
         return {"delivered": False, "reason": "not_found"}
+
+    # 1. Revalidate User Account Active Status
+    user = await session.get(User, notif.user_id)
+    if not user or not user.is_active:
+        logger.warning("notification_aborted_user_inactive", user_id=str(notif.user_id))
+        return {"delivered": False, "reason": "recipient_user_deactivated"}
+
+    # 2. Idempotency Check: Verify notification has not already been delivered
+    if notif.is_read:
+        logger.info("notification_delivery_skipped_already_delivered", notification_id=str(notif.id))
+        return {
+            "delivered": True,
+            "status": "skipped_duplicate_idempotent",
+            "notification_id": str(notif.id),
+        }
+
+    # 3. Consequential Action Gate: external webhooks require confirmation flag in resource_type
+    if notif.notification_type in ("external_webhook", "external_email"):
+        if notif.resource_type != "confirmed":
+            logger.warning("external_notification_aborted_missing_confirmation", notification_id=str(notif.id))
+            return {"delivered": False, "reason": "external_delivery_requires_confirmation"}
+
+    # Mark delivery state atomically
+    notif.is_read = True
+    await session.commit()
 
     logger.info(
         "notification_dispatched",

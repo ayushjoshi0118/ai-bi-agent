@@ -8,6 +8,7 @@ and immutable audit logging.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, status
@@ -23,6 +24,7 @@ from app.models.conversation import Conversation, Message, MessageRole
 from app.models.dataset import Dataset
 from app.models.organization import OrgMembership, OrgRole
 from app.models.query import QueryExecution
+from app.monitoring.metrics import metrics_collector
 from app.analytics.ambiguity import AmbiguityDetector
 from app.analytics.metrics import default_metric_catalog
 from app.analytics.pipeline import ResultExplainer, ResultVerifier, VerifiedKPI
@@ -153,10 +155,16 @@ class AIOrchestrator:
 
         # Tool execution loop (max 5 iterations for security, cost, and latency bounds)
         for iteration in range(5):
+            t_llm_start = time.perf_counter()
             llm_response = await provider.chat_completion(
                 messages=messages_payload,
                 tools=tools,
             )
+            t_llm_duration = (time.perf_counter() - t_llm_start) * 1000.0
+            usage = llm_response.usage or {}
+            in_tok = usage.get("prompt_tokens", 250)
+            out_tok = usage.get("completion_tokens", 50)
+            metrics_collector.record_llm_request(duration_ms=t_llm_duration, input_tokens=in_tok, output_tokens=out_tok)
 
             if not llm_response.tool_calls:
                 assistant_content = llm_response.content or "Analysis completed."

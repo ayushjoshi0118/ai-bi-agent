@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.models.query import QueryExecution
 from app.models.report import Report, ReportStatus, ReportVersion, SavedAnalysis
 from app.schemas.report import ReportCreate, ReportUpdate, SavedAnalysisCreate
+from app.security.tenant_security import TenantSecurityManager
 from app.services.audit_service import AuditService
 
 
@@ -122,7 +123,15 @@ class ReportService:
         res = await db.execute(stmt)
         report = res.scalar_one_or_none()
         if not report:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+            # Check for cross-tenant attempt and log security audit event
+            await TenantSecurityManager.verify_object_ownership(
+                db=db,
+                org_id=org_id,
+                user_id=uuid.uuid4(),
+                model_class=Report,
+                object_id=report_id,
+                resource_label="report",
+            )
         return report
 
     @staticmethod
