@@ -26,12 +26,14 @@ class ReportService:
     ) -> SavedAnalysis:
         analysis = SavedAnalysis(
             org_id=org_id,
-            user_id=user_id,
+            created_by=user_id,
             title=req.title.strip(),
             description=req.description,
             conversation_id=req.conversation_id,
-            query_execution_id=req.query_execution_id,
-            chart_config=req.chart_config or {},
+            analysis_data={
+                "query_execution_id": str(req.query_execution_id) if req.query_execution_id else None,
+                "chart_config": req.chart_config or {},
+            },
         )
         db.add(analysis)
         await db.commit()
@@ -77,12 +79,16 @@ class ReportService:
         initial_version = ReportVersion(
             report_id=report.id,
             version_number=1,
-            content=report.config,
-            data_snapshot={"created_at": datetime.now(timezone.utc).isoformat()},
+            content={
+                "config": report.config or {},
+                "data_snapshot": {"created_at": datetime.now(timezone.utc).isoformat()},
+            },
+            change_summary="Initial version",
+            created_by=user_id,
         )
         db.add(initial_version)
         await db.commit()
-        await db.refresh(report)
+        await db.refresh(report, ["versions"])
 
         await AuditService.log_event(
             db,
@@ -137,13 +143,17 @@ class ReportService:
             new_version = ReportVersion(
                 report_id=report.id,
                 version_number=latest_version_num + 1,
-                content=req.config,
-                data_snapshot={"updated_at": datetime.now(timezone.utc).isoformat()},
+                content={
+                    "config": req.config,
+                    "data_snapshot": {"updated_at": datetime.now(timezone.utc).isoformat()},
+                },
+                change_summary="Updated configuration",
+                created_by=user_id,
             )
             db.add(new_version)
 
         await db.commit()
-        await db.refresh(report)
+        await db.refresh(report, ["versions"])
 
         await AuditService.log_event(
             db,

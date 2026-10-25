@@ -53,16 +53,23 @@ LLM_API_KEY=sk-prod-...
 
 ## 3. Database Migrations
 
-Apply Alembic migrations to initialize or upgrade the database schema:
+Apply Alembic migrations to initialize or upgrade the database schema across all 15 production tables:
 
 ```bash
-# Run migrations via Docker
+# Verify current migration status
+docker compose -f docker-compose.prod.yml run --rm backend alembic current
+
+# Run migrations up to head (0001_initial -> 0002_complete_schema)
 docker compose -f docker-compose.prod.yml run --rm backend alembic upgrade head
 
-# Or locally with Python:
+# Or locally in virtualenv:
 cd backend
 alembic upgrade head
 ```
+
+The migration sequence establishes:
+1. `0001_initial`: Core identities (`users`, `organizations`, `org_memberships`).
+2. `0002_complete_schema`: Analytics, execution, and workflow assets (`data_sources`, `datasets`, `conversations`, `messages`, `query_executions`, `reports`, `report_versions`, `saved_analyses`, `scheduled_jobs`, `job_runs`, `anomaly_detections`, `audit_events`, `notifications`).
 
 ---
 

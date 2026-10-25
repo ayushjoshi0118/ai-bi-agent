@@ -137,5 +137,22 @@ class SavedAnalysis(BaseModel):
         default=False, server_default="false", nullable=False,
     )
 
+    @property
+    def user_id(self) -> uuid.UUID | None:
+        return self.created_by
+
+    @property
+    def query_execution_id(self) -> uuid.UUID | None:
+        if self.analysis_data and self.analysis_data.get("query_execution_id"):
+            try:
+                return uuid.UUID(str(self.analysis_data["query_execution_id"]))
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    @property
+    def chart_config(self) -> dict | None:
+        return self.analysis_data.get("chart_config") if self.analysis_data else None
+
     def __repr__(self) -> str:
         return f"<SavedAnalysis {self.title[:40]}>"

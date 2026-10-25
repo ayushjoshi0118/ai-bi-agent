@@ -85,6 +85,10 @@ class AnomalyDetection(BaseModel):
         DateTime(timezone=True), nullable=True,
     )
 
+    @property
+    def explanation(self) -> str | None:
+        return self.description
+
     # ── Relationships ────────────────────────────────────────────────────
     organization: Mapped["Organization"] = relationship(
         "Organization", back_populates="anomaly_detections",

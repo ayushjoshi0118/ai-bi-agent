@@ -11,7 +11,8 @@ Provides:
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
+from contextlib import contextmanager
 
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import (
@@ -58,6 +59,24 @@ SyncSessionLocal = sessionmaker(
     expire_on_commit=False,
     autoflush=False,
 )
+
+
+@contextmanager
+def get_sync_session() -> Generator[Session, None, None]:
+    """Context manager for synchronous database sessions (Celery / CLI)."""
+    session = SyncSessionLocal()
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+# Context manager alias
+get_sync_db = get_sync_session
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:

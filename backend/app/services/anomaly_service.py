@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 import structlog
 
 from app.models.anomaly import AnomalyDetection, AnomalySeverity, AnomalyStatus
@@ -39,7 +40,11 @@ class AnomalyService:
         """
         Run statistical anomaly detection over a numeric column in the dataset.
         """
-        stmt = select(Dataset).where(Dataset.id == dataset_id, Dataset.org_id == org_id)
+        stmt = (
+            select(Dataset)
+            .options(selectinload(Dataset.data_source))
+            .where(Dataset.id == dataset_id, Dataset.org_id == org_id)
+        )
         res = await db.execute(stmt)
         dataset = res.scalar_one_or_none()
         if not dataset:

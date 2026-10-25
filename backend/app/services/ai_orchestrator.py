@@ -74,7 +74,11 @@ class AIOrchestrator:
         await db.flush()
 
         # 3. Retrieve permitted datasets
-        dataset_query = select(Dataset).where(Dataset.org_id == org_id)
+        dataset_query = (
+            select(Dataset)
+            .options(selectinload(Dataset.data_source))
+            .where(Dataset.org_id == org_id)
+        )
         if dataset_ids:
             dataset_query = dataset_query.where(Dataset.id.in_(dataset_ids))
         res = await db.execute(dataset_query)
@@ -221,7 +225,7 @@ class AIOrchestrator:
                             method=args.get("method", "z_score"),
                         )
                         result_str = json.dumps([
-                            {"metric": a.metric_name, "value": a.metric_value, "severity": a.severity.value, "explanation": a.explanation}
+                            {"metric": a.metric_name, "value": a.metric_value, "severity": a.severity.value, "explanation": a.description or ""}
                             for a in anoms
                         ])
                     except Exception as e:
